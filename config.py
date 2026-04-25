@@ -31,6 +31,14 @@ DLIB_MODEL_PATH = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat"
 
 TARGET_FRAMES = 75    # 3 s × 25 fps
 
+# ── GRID corpus fixed coarse crop (used in data_loader.py stage-1 ROI) ───────
+# These slice the lower-face region before dlib runs, speeding up detection
+# and reducing false positives on the fixed-camera GRID setup.
+# They are NOT the final crop size — dlib refines the exact lip region within
+# this ROI. The final crop dimensions vary per video (adaptive resolution).
+GRID_CROP_Y = slice(190, 236)   # vertical ROI: rows 190–236
+GRID_CROP_X = slice(80, 220)    # horizontal ROI: cols 80–220
+
 # ── Spatial crop parameters (replaces fixed TARGET_H / TARGET_W) ──────────────
 
 # Fraction of the lip bounding box width/height added as padding on ALL sides.

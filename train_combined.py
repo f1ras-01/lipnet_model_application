@@ -1,126 +1,163 @@
 """
 train_combined.py
 -----------------
-Fine-tunes the LipNet model on a combination of datasets:
+Fine-tune the LipNet model on a combination of datasets.
 
-    Mode A:  GRID + MIRACL-VC1    (--mode miracl)
-    Mode B:  GRID + Personal data (--mode personal)
-    Mode C:  MIRACL only          (--mode miracl --no-grid)
-    Mode D:  Personal only        (--mode personal --no-grid)
+Modes:
+  --mode miracl    ->  GRID + MIRACL-VC1  (or MIRACL only with --no-grid)
+  --mode personal  ->  GRID + personal data recorded via make_personal_dataset.py
 
 Strategy:
-    1. Load existing checkpoint (keeps what the model learned from GRID).
-    2. Add new data on top.
-    3. Train with a lower learning rate (0.00001 instead of 0.0001) to avoid
-       catastrophic forgetting — the model adjusts rather than re-learns.
+  1. Load existing checkpoint (preserves everything learned from GRID training).
+  2. Combine with new dataset.
+  3. Fine-tune at a lower learning rate (default 1e-5 vs training 1e-4) to
+     avoid catastrophic forgetting of the original GRID knowledge.
+
+All datasets now produce variable-resolution tensors — padded_batch handles
+within-batch spatial variation identically to the main training pipeline.
 
 Run with:
     python train_combined.py --mode miracl   --miracl-root miraclvc1/
     python train_combined.py --mode personal --personal-root personal_data/
+    python train_combined.py --mode miracl   --miracl-root miraclvc1/ --augment
     python train_combined.py --mode miracl   --miracl-root miraclvc1/ --no-grid
 """
 
 import argparse
+import glob
+import importlib
 import os
 
 import tensorflow as tf
 
-# ── GPU ───────────────────────────────────────────────────────────────────────
+# ── GPU setup ─────────────────────────────────────────────────────────────────
 physical_devices = tf.config.list_physical_devices("GPU")
 try:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    print(f"GPU: {physical_devices[0]}")
 except (IndexError, RuntimeError):
-    pass
+    print("No GPU found — running on CPU.")
 
-# ── Imports ───────────────────────────────────────────────────────────────────
-from config import CHECKPOINT_PATH, MODEL_DIR
+from config import CHECKPOINT_PATH, MODEL_DIR, TARGET_FRAMES
 from model import CTCLoss, build_model, get_callbacks
 
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train LipNet on combined datasets.")
-    parser.add_argument("--mode",          choices=["miracl", "personal"], required=True)
-    parser.add_argument("--miracl-root",   default="miraclvc1/",
-                        help="Root folder of MIRACL dataset")
-    parser.add_argument("--personal-root", default="personal_data/",
-                        help="Root folder of personal dataset (from make_personal_dataset.py)")
-    parser.add_argument("--no-grid",       action="store_true",
-                        help="Don't include the GRID corpus (fine-tune on new data only)")
-    parser.add_argument("--epochs",        type=int, default=50,
-                        help="Number of additional epochs (default: 50)")
-    parser.add_argument("--lr",            type=float, default=0.00001,
-                        help="Fine-tuning learning rate (default: 0.00001 — lower than initial)")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune LipNet on GRID + MIRACL or GRID + personal data."
+    )
+    parser.add_argument(
+        "--mode", choices=["miracl", "personal"], required=True,
+        help="Which additional dataset to include."
+    )
+    parser.add_argument(
+        "--miracl-root", default="miraclvc1/",
+        help="Root folder of the MIRACL-VC1 dataset (default: miraclvc1/)."
+    )
+    parser.add_argument(
+        "--personal-root", default="personal_data/",
+        help="Root folder created by make_personal_dataset.py (default: personal_data/)."
+    )
+    parser.add_argument(
+        "--no-grid", action="store_true",
+        help="Exclude the GRID corpus — train on new data only."
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=50,
+        help="Number of fine-tuning epochs (default: 50)."
+    )
+    parser.add_argument(
+        "--lr", type=float, default=0.00001,
+        help="Fine-tuning learning rate (default: 1e-5, lower than initial 1e-4)."
+    )
+    parser.add_argument(
+        "--augment", action="store_true",
+        help="Enable H-flip + frame jitter augmentation on the new dataset."
+    )
+    parser.add_argument(
+        "--speaker", default="s1",
+        help="Speaker subfolder name for personal data (default: s1)."
+    )
     args = parser.parse_args()
 
-    # ── Build train / test datasets ───────────────────────────────────────────
+    # ── padded_shapes shared by all datasets ──────────────────────────────────
+    # None, None for H and W — adapts to whatever crop size each video produces
+    _padded_shapes = ([TARGET_FRAMES, None, None, None], [40])
+
     train_datasets = []
     test_datasets  = []
 
+    # ── GRID corpus ───────────────────────────────────────────────────────────
     if not args.no_grid:
         from dataset import train as grid_train, test as grid_test
         train_datasets.append(grid_train)
         test_datasets.append(grid_test)
         print("✅ GRID corpus included.")
 
+    # ── MIRACL-VC1 ────────────────────────────────────────────────────────────
     if args.mode == "miracl":
         from data_loader_miracl import build_miracl_dataset
-        miracl_train, miracl_test = build_miracl_dataset(args.miracl_root)
+        miracl_train, miracl_test = build_miracl_dataset(
+            miracl_root  = args.miracl_root,
+            use_phrases  = True,
+            augment      = args.augment,
+        )
         train_datasets.append(miracl_train)
         test_datasets.append(miracl_test)
         print("✅ MIRACL-VC1 included.")
 
+    # ── Personal data ─────────────────────────────────────────────────────────
     elif args.mode == "personal":
-        # Personal data uses the exact same folder structure as GRID,
-        # so we just rebuild the pipeline pointing at the personal_data folder.
-        import glob
-        personal_video_dir = os.path.join(args.personal_root, "s1")
-        personal_align_dir = os.path.join(args.personal_root, "alignments", "s1")
+        personal_video_dir = os.path.join(args.personal_root, args.speaker)
+        personal_align_dir = os.path.join(args.personal_root, "alignments", args.speaker)
 
         if not os.path.isdir(personal_video_dir):
             raise FileNotFoundError(
                 f"Personal video folder not found: {personal_video_dir}\n"
-                "Run make_personal_dataset.py first."
+                "Run make_personal_dataset.py first to record your data."
             )
 
-        # Temporarily override config paths for personal data
-        import config
-        original_data_dir  = config.DATA_DIR
-        original_align_dir = config.ALIGN_DIR
-
-        config.DATA_DIR  = personal_video_dir
-        config.ALIGN_DIR = personal_align_dir
-
-        # Reimport dataset with new paths
-        import importlib
-        import dataset as ds_module
-        importlib.reload(ds_module)
-
-        train_datasets.append(ds_module.train)
-        test_datasets.append(ds_module.test)
-
-        # Restore original config
-        config.DATA_DIR  = original_data_dir
-        config.ALIGN_DIR = original_align_dir
-
         n_vids = len(glob.glob(os.path.join(personal_video_dir, "*.mpg")))
-        print(f"✅ Personal data included ({n_vids} videos).")
+        if n_vids == 0:
+            raise ValueError(f"No .mpg files found in {personal_video_dir}")
 
-    if len(train_datasets) == 0:
+        # Temporarily override DATA_DIR and ALIGN_DIR in config so that
+        # dataset.py builds a pipeline pointing at the personal data folder.
+        import config as cfg
+        original_data_dir  = cfg.DATA_DIR
+        original_align_dir = cfg.ALIGN_DIR
+
+        cfg.DATA_DIR  = personal_video_dir
+        cfg.ALIGN_DIR = personal_align_dir
+
+        import dataset as ds_mod
+        importlib.reload(ds_mod)
+
+        train_datasets.append(ds_mod.train)
+        test_datasets.append(ds_mod.test)
+
+        # Restore original paths so nothing else is affected
+        cfg.DATA_DIR  = original_data_dir
+        cfg.ALIGN_DIR = original_align_dir
+
+        print(f"✅ Personal data included ({n_vids} videos from {personal_video_dir}).")
+
+    if not train_datasets:
         raise ValueError("No datasets selected. Check your arguments.")
 
     # ── Combine datasets ──────────────────────────────────────────────────────
     combined_train = train_datasets[0]
     combined_test  = test_datasets[0]
+
     for ds in train_datasets[1:]:
         combined_train = combined_train.concatenate(ds)
     for ds in test_datasets[1:]:
         combined_test  = combined_test.concatenate(ds)
 
-    # Re-shuffle the combined training set so GRID and new data are mixed
+    # Shuffle combined training set so GRID and new data are interleaved
     combined_train = combined_train.shuffle(1000, reshuffle_each_iteration=True)
 
-    # ── Build model and load existing weights ─────────────────────────────────
+    # ── Build model and load checkpoint ───────────────────────────────────────
     model = build_model()
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
@@ -129,8 +166,8 @@ def main():
 
     if os.path.exists(CHECKPOINT_PATH + ".index"):
         model.load_weights(CHECKPOINT_PATH).expect_partial()
-        print(f"✅ Loaded checkpoint: {CHECKPOINT_PATH}")
-        print(f"   Fine-tuning with lr={args.lr} (lower than initial to avoid forgetting)")
+        print(f"✅ Checkpoint loaded: {CHECKPOINT_PATH}")
+        print(f"   Fine-tuning lr={args.lr}  (lower than initial 1e-4 to avoid forgetting)")
     else:
         print("⚠️  No checkpoint found — training from scratch.")
 
@@ -140,7 +177,7 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     callbacks = get_callbacks(combined_test)
 
-    print(f"\nFine-tuning for {args.epochs} epochs …\n")
+    print(f"\nFine-tuning for {args.epochs} epochs ...\n")
     model.fit(
         combined_train,
         validation_data=combined_test,
