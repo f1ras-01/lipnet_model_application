@@ -1,51 +1,73 @@
 """
 config.py
 ---------
-Single source of truth for every path and constant used across the project.
-Change values here and every other file picks them up automatically.
+Single source of truth for every path and constant.
+
+TARGET_H and TARGET_W are now REMOVED.
+The model accepts variable spatial dimensions — crops are taken at native
+resolution and the model uses GlobalAveragePooling2D to collapse them.
+
+New crop-control parameters:
+  CROP_PADDING_RATIO  — how much whitespace to add around the lip bounding box
+                        as a fraction of the box size (0.5 = 50% padding each side)
+  MIN_CROP_H / _W     — floor on crop size so very-low-res videos still have
+                        enough pixels for the CNN kernels to operate on
+  CROP_ALIGN_MULTIPLE — spatial dims are rounded up to this multiple so
+                        MaxPool3D(1,2,2) divisions never produce fractional sizes
 """
 
 import os
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-# Root of the project (folder that contains this file)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# GRID corpus data
-DATA_DIR        = os.path.join(BASE_DIR, "data", "s1")          # .mpg files
-ALIGN_DIR       = os.path.join(BASE_DIR, "data", "alignments", "s1")  # .align files
-
-# Saved model weights
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR        = os.path.join(BASE_DIR, "data", "s1")
+ALIGN_DIR       = os.path.join(BASE_DIR, "data", "alignments", "s1")
 MODEL_DIR       = os.path.join(BASE_DIR, "models")
 CHECKPOINT_PATH = os.path.join(MODEL_DIR, "checkpoint")
-
-# dlib landmark model — must be downloaded manually and placed here
 DLIB_MODEL_PATH = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat")
 
-# ── Model input dimensions ────────────────────────────────────────────────────
+# ── Temporal dimension (fixed — CTC requires fixed time steps per batch) ──────
 
-TARGET_FRAMES = 75      # Number of frames per video clip
-TARGET_H      = 46      # Frame height in pixels  (mouth crop)
-TARGET_W      = 140     # Frame width in pixels   (mouth crop)
+TARGET_FRAMES = 75    # 3 s × 25 fps
 
-# Pixel crop for the GRID corpus videos (fixed camera, fixed speaker position)
-# These values slice [y_start:y_end, x_start:x_end] from each 360×288 grayscale frame
-GRID_CROP_Y = slice(190, 236)   # height → 46 px
-GRID_CROP_X = slice(80, 220)    # width  → 140 px
+# ── Spatial crop parameters (replaces fixed TARGET_H / TARGET_W) ──────────────
+
+# Fraction of the lip bounding box width/height added as padding on ALL sides.
+# 0.5 → crop is 2× the tight lip box in each dimension, giving natural context.
+CROP_PADDING_RATIO = 0.5
+
+# Minimum crop dimensions in pixels. Prevents the CNN from receiving patches
+# smaller than its kernel sizes (3×5×5 / 3×3×3).
+MIN_CROP_H = 32
+MIN_CROP_W = 48
+
+# All crop dimensions are rounded UP to the nearest multiple of this value.
+# With 3 MaxPool3D(1,2,2) layers the spatial dims are halved 3 times (÷8).
+# Aligning to 8 keeps every post-pool dimension an integer.
+CROP_ALIGN_MULTIPLE = 8
+
+# ── Color / normalization (paper Appendix A.2) ────────────────────────────────
+
+TARGET_C       = 3    # RGB
+CHANNEL_MEANS  = [0.7136, 0.4906, 0.3283]   # [R, G, B] over GRID training set
+CHANNEL_STDS   = [0.1138, 0.1078, 0.0917]
 
 # ── Vocabulary ────────────────────────────────────────────────────────────────
 
 VOCAB = list("abcdefghijklmnopqrstuvwxyz'?!123456789 ")
 
-# ── Dataset split ─────────────────────────────────────────────────────────────
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
-TRAIN_SIZE  = 450       # Number of batches kept for training
-BATCH_SIZE  = 2         # Videos per batch
+TRAIN_SIZE = 450
+BATCH_SIZE = 2
 
-# ── Training hyperparameters ──────────────────────────────────────────────────
+# ── Training (paper Appendix A.1) ─────────────────────────────────────────────
 
-LEARNING_RATE   = 0.0001
-EPOCHS          = 100
-LR_DECAY_EPOCH  = 30    # Epoch after which learning rate starts decaying
-LR_DECAY_FACTOR = 0.1   # tf.math.exp(-0.1) ≈ 0.905 per epoch
+LEARNING_RATE  = 0.0001
+EPOCHS         = 100
+LR_DECAY_EPOCH = 30
+
+# ── CTC beam search (paper uses 200; 100 is CPU-practical) ────────────────────
+
+BEAM_WIDTH = 100

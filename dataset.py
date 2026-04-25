@@ -1,57 +1,56 @@
 """
 dataset.py
 ----------
-Builds the tf.data pipeline used for training and validation.
+tf.data pipeline — updated for variable spatial dimensions.
 
-Exports:
-    train   — batched, shuffled, prefetched dataset (450 batches)
-    test    — remaining batches used for validation and the example callback
+The key change is in padded_batch:
+  - frames padded_shape: [TARGET_FRAMES, None, None, None]
+    The None, None for H and W tells TF to pad each batch to the MAXIMUM
+    H and W seen in that batch. Videos with smaller crops get zero-padded
+    on the right and bottom edges.
+  - GlobalAveragePooling2D in the model averages over H×W, so the zero
+    padding has a small diluting effect (≈proportional to how much padding
+    was added) rather than corrupting the features.
 
-Pipeline steps:
-    1. list_files     — glob all .mpg files in DATA_DIR
-    2. shuffle        — randomise order once (reshuffle=False for reproducibility)
-    3. map            — run load_data on each file path via mappable_function
-    4. padded_batch   — group into batches of 2, padding alignments to length 40
-    5. prefetch       — overlap GPU compute with CPU data loading
-    6. take / skip    — train/test split
+Training: augmented (H-flip + frame jitter)
+Test:     no augmentation
 """
 
 import tensorflow as tf
 
 from config import BATCH_SIZE, DATA_DIR, TARGET_FRAMES, TRAIN_SIZE
-from data_loader import mappable_function
+from data_loader import mappable_function, mappable_function_augment
 
-# ── Build the full dataset ────────────────────────────────────────────────────
+# List all .mpg files and shuffle once
+data_all = tf.data.Dataset.list_files(f"{DATA_DIR}/*.mpg")
+data_all = data_all.shuffle(500, reshuffle_each_iteration=False)
 
-data = tf.data.Dataset.list_files(f"{DATA_DIR}/*.mpg")
-data = data.shuffle(500, reshuffle_each_iteration=False)
-data = data.map(mappable_function)
-data = data.padded_batch(
-    BATCH_SIZE,
-    padded_shapes=(
-        [TARGET_FRAMES, None, None, None],  # frames — pad spatial dims if needed
-        [40],                               # alignments — pad to max label length
-    )
+train_files = data_all.take(TRAIN_SIZE)
+test_files  = data_all.skip(TRAIN_SIZE)
+
+# padded_shapes: None for H and W means "pad to batch maximum"
+_padded_shapes = (
+    [TARGET_FRAMES, None, None, None],  # frames: (T, H, W, C) — H, W vary
+    [40],                               # labels: pad to max label length
 )
-data = data.prefetch(tf.data.AUTOTUNE)
 
-# ── Train / test split ────────────────────────────────────────────────────────
+train = (
+    train_files
+    .map(mappable_function_augment, num_parallel_calls=tf.data.AUTOTUNE)
+    .padded_batch(BATCH_SIZE, padded_shapes=_padded_shapes)
+    .prefetch(tf.data.AUTOTUNE)
+)
 
-train = data.take(TRAIN_SIZE)
-test  = data.skip(TRAIN_SIZE)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick inspection (run this file directly to verify the pipeline)
-# ─────────────────────────────────────────────────────────────────────────────
+test = (
+    test_files
+    .map(mappable_function, num_parallel_calls=tf.data.AUTOTUNE)
+    .padded_batch(BATCH_SIZE, padded_shapes=_padded_shapes)
+    .prefetch(tf.data.AUTOTUNE)
+)
 
 if __name__ == "__main__":
-    print(f"Total batches : {len(data)}")
-    print(f"Train batches : {len(train)}")
-    print(f"Test batches  : {len(test)}")
-    print()
-
-    sample = data.as_numpy_iterator().next()
-    frames_batch, align_batch = sample
-
-    print(f"frames_batch shape : {frames_batch.shape}")  # (2, 75, 46, 140, 1)
-    print(f"align_batch shape  : {align_batch.shape}")   # (2, 40)
+    print(f"Train batches: {len(train)}")
+    print(f"Test batches : {len(test)}")
+    sample = train.as_numpy_iterator().next()
+    print(f"frames shape : {sample[0].shape}")   # (2, 75, H, W, 3) — H,W = max in batch
+    print(f"labels shape : {sample[1].shape}")

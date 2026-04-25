@@ -1,27 +1,22 @@
 """
 visualize.py
 ------------
-Diagnostic visualisation tools. Run this when you want to check whether
-dlib is correctly detecting your face and cropping the mouth region.
+Visualisation tools — updated to show adaptive crop regions.
 
-Two functions:
+visualize_landmarks(video_path)
+    Full frame with face box, landmark dots, and the ADAPTIVE crop box
+    (red dashed) sized by CROP_PADDING_RATIO — not a fixed pixel rectangle.
 
-  visualize_landmarks(video_path)
-      Displays a grid of sampled frames with the 68 facial landmark dots,
-      face bounding box, and the mouth crop bounding box drawn on top.
-
-  visualize_mouth_crops(video_path)
-      Displays the actual 46×140 grayscale images that would be fed into
-      the model — exactly what the model sees.
+visualize_mouth_crops(video_path)
+    The actual variable-size crops at native resolution that the pipeline
+    would feed to the model. Each tile shows its own dimensions.
 
 Run with:
-    python visualize.py
-    python visualize.py --video "path/to/your/video.mp4" --mode both
-    python visualize.py --video "path/to/your/video.mp4" --mode landmarks
-    python visualize.py --video "path/to/your/video.mp4" --mode crops
+    python visualize.py --video "path/to/video.mp4" --mode both
 """
 
 import argparse
+import os
 
 import cv2
 import dlib
@@ -29,62 +24,48 @@ import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 
-from config import DLIB_MODEL_PATH, TARGET_H, TARGET_W
+from config import DLIB_MODEL_PATH, MIN_CROP_H, MIN_CROP_W, TARGET_C
+from crop_utils import canonical_size, crop_mouth, normalize_rgb
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared helper: load dlib tools once and reuse
-# ─────────────────────────────────────────────────────────────────────────────
+MOUTH_POINTS = list(range(48, 68))
 
-def _get_dlib_tools():
-    """Return (detector, predictor, MOUTH_POINTS) — loads from disk once."""
-    import os
+
+def _get_dlib():
     if not os.path.exists(DLIB_MODEL_PATH):
-        raise FileNotFoundError(
-            f"dlib model not found at: {DLIB_MODEL_PATH}\n"
-            "Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-        )
-    detector  = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
-    mouth_pts = list(range(48, 68))
-    return detector, predictor, mouth_pts
+        raise FileNotFoundError(f"dlib model not found: {DLIB_MODEL_PATH}")
+    return dlib.get_frontal_face_detector(), dlib.shape_predictor(DLIB_MODEL_PATH)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Function 1: Landmarks on full frames
+# Function 1 — Full frame with adaptive crop box
 # ─────────────────────────────────────────────────────────────────────────────
 
 def visualize_landmarks(video_path: str, num_frames_to_show: int = 6) -> None:
     """
-    Show a grid of sampled video frames with facial landmarks overlaid.
+    Show sampled frames with landmarks and the ADAPTIVE crop rectangle.
 
-    Each subplot shows:
-      - Green rectangle  → face bounding box detected by dlib
-      - Blue dots        → all 68 facial landmark points
-      - Red dots         → only the 20 mouth landmarks (points 48–67)
-      - Red dashed box   → exact crop region that goes into the model
-
-    Args:
-        video_path:        Path to any video file.
-        num_frames_to_show: How many frames to sample and display (must be even).
+    The crop box reflects the actual CROP_PADDING_RATIO — it grows with the
+    face size, shrinks for distant faces, and is always aligned to 8 pixels.
     """
-    detector, predictor, MOUTH_POINTS = _get_dlib_tools()
+    from crop_utils import CROP_PADDING_RATIO
+    detector, predictor = _get_dlib()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {video_path}")
+        raise ValueError(f"Cannot open: {video_path}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames in video: {total_frames}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    h_nat = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w_nat = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    print(f"Video: {os.path.basename(video_path)}  |  {w_nat}×{h_nat} px  |  {total} frames")
 
-    # Evenly spaced frame indices
-    sample_indices = np.linspace(0, total_frames - 1, num_frames_to_show, dtype=int)
-
-    cols = num_frames_to_show // 2
+    indices = np.linspace(0, total - 1, num_frames_to_show, dtype=int)
+    cols    = num_frames_to_show // 2
     fig, axes = plt.subplots(2, cols, figsize=(cols * 5, 8))
     axes = axes.flatten()
 
-    for plot_idx, frame_idx in enumerate(sample_indices):
+    for plot_idx, frame_idx in enumerate(indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
@@ -92,169 +73,144 @@ def visualize_landmarks(video_path: str, num_frames_to_show: int = 6) -> None:
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        ax = axes[plot_idx]
+        ax        = axes[plot_idx]
         ax.imshow(frame_rgb)
-        ax.set_title(f"Frame {frame_idx}", fontsize=10)
+        ax.set_title(f"Frame {frame_idx}", fontsize=9)
         ax.axis("off")
 
         faces = detector(gray)
-
-        if len(faces) == 0:
-            ax.set_title(f"Frame {frame_idx} — NO FACE DETECTED", color="red", fontsize=9)
+        if not faces:
+            ax.set_title(f"Frame {frame_idx} — NO FACE", color="red", fontsize=9)
             continue
 
         face      = faces[0]
         landmarks = predictor(gray, face)
 
-        # Green face bounding box
-        face_rect = patches.Rectangle(
+        # Face box (green)
+        ax.add_patch(patches.Rectangle(
             (face.left(), face.top()), face.width(), face.height(),
             linewidth=2, edgecolor="lime", facecolor="none",
-        )
-        ax.add_patch(face_rect)
+        ))
 
-        # Blue dots — all 68 landmarks
-        all_coords = np.array([[landmarks.part(n).x, landmarks.part(n).y] for n in range(68)])
-        ax.scatter(all_coords[:, 0], all_coords[:, 1], s=8, c="dodgerblue", zorder=5)
+        # All 68 landmarks (blue)
+        all_c = np.array([[landmarks.part(n).x, landmarks.part(n).y] for n in range(68)])
+        ax.scatter(all_c[:, 0], all_c[:, 1], s=6, c="dodgerblue", zorder=5)
 
-        # Red dots — mouth landmarks only
-        mouth_coords = np.array([
-            [landmarks.part(n).x, landmarks.part(n).y] for n in MOUTH_POINTS
-        ])
-        ax.scatter(mouth_coords[:, 0], mouth_coords[:, 1], s=20, c="red", zorder=6)
+        # Mouth landmarks (red)
+        mc = np.array([[landmarks.part(n).x, landmarks.part(n).y] for n in MOUTH_POINTS])
+        ax.scatter(mc[:, 0], mc[:, 1], s=16, c="red", zorder=6)
 
-        # Red dashed box — mouth crop region
-        x_min = mouth_coords[:, 0].min() - 10
-        x_max = mouth_coords[:, 0].max() + 10
-        y_min = mouth_coords[:, 1].min() - 10
-        y_max = mouth_coords[:, 1].max() + 10
-        mouth_rect = patches.Rectangle(
-            (x_min, y_min), x_max - x_min, y_max - y_min,
+        # Adaptive crop box (red dashed)
+        lip_w = mc[:, 0].max() - mc[:, 0].min()
+        lip_h = mc[:, 1].max() - mc[:, 1].min()
+        pad_x = lip_w * CROP_PADDING_RATIO
+        pad_y = lip_h * CROP_PADDING_RATIO
+        bx = max(mc[:, 0].min() - pad_x, 0)
+        by = max(mc[:, 1].min() - pad_y, 0)
+        bw = min(mc[:, 0].max() + pad_x, frame_rgb.shape[1]) - bx
+        bh = min(mc[:, 1].max() + pad_y, frame_rgb.shape[0]) - by
+        ax.add_patch(patches.Rectangle(
+            (bx, by), bw, bh,
             linewidth=2, edgecolor="red", facecolor="none", linestyle="--",
-        )
-        ax.add_patch(mouth_rect)
+        ))
+        ax.text(bx, by - 4, f"adaptive {int(bw)}×{int(bh)}px",
+                color="red", fontsize=6, va="bottom")
 
     cap.release()
-
     plt.suptitle(
-        "Face Landmarks Visualization\n"
-        "🟢 Face box   🔵 All 68 landmarks   🔴 Mouth landmarks & crop box",
-        fontsize=13, fontweight="bold",
+        f"Adaptive Crop Visualization — {os.path.basename(video_path)}\n"
+        f"🟢 Face box  🔵 All landmarks  🔴 Adaptive lip crop  "
+        f"(padding ratio: {CROP_PADDING_RATIO})",
+        fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
     plt.show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Function 2: Cropped mouth frames (model's actual input)
+# Function 2 — Adaptive mouth crops (model input)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def visualize_mouth_crops(
-    video_path: str,
-    num_frames_to_show: int = 15,
-    target_h: int = TARGET_H,
-    target_w: int = TARGET_W,
-) -> None:
+def visualize_mouth_crops(video_path: str, num_frames_to_show: int = 15) -> None:
     """
-    Show the cropped, resized mouth frames that would actually enter the model.
-
-    Each tile is exactly target_w × target_h (140×46) grayscale pixels —
-    identical to what load_custom_video() produces.
-
-    Args:
-        video_path:         Path to any video file.
-        num_frames_to_show: Number of frames to sample and display.
-        target_h:           Crop height (should match model input, default 46).
-        target_w:           Crop width  (should match model input, default 140).
+    Show the actual variable-size crops that would enter the model.
+    Each tile displays its own pixel dimensions.
+    Also prints what canonical_size() would choose for batch standardisation.
     """
-    detector, predictor, MOUTH_POINTS = _get_dlib_tools()
+    detector, predictor = _get_dlib()
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {video_path}")
+    cap   = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    indices = np.linspace(0, total - 1, num_frames_to_show, dtype=int)
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    sample_indices = np.linspace(0, total_frames - 1, num_frames_to_show, dtype=int)
+    crops, labels = [], []
 
-    crops  = []
-    labels = []
-
-    for frame_idx in sample_indices:
+    for frame_idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
             continue
 
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = detector(gray)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces     = detector(gray)
 
-        if len(faces) == 0:
-            mouth_resized = np.zeros((target_h, target_w), dtype=np.uint8)
+        if not faces:
+            crop = np.zeros((MIN_CROP_H, MIN_CROP_W, TARGET_C), dtype=np.uint8)
             labels.append(f"F{frame_idx}\n(no face)")
         else:
-            face      = faces[0]
-            landmarks = predictor(gray, face)
-            mouth_coords = np.array([
-                [landmarks.part(n).x, landmarks.part(n).y] for n in MOUTH_POINTS
-            ])
-            x_min = max(int(mouth_coords[:, 0].min()) - 10, 0)
-            x_max = min(int(mouth_coords[:, 0].max()) + 10, frame.shape[1])
-            y_min = max(int(mouth_coords[:, 1].min()) - 10, 0)
-            y_max = min(int(mouth_coords[:, 1].max()) + 10, frame.shape[0])
-
-            mouth_crop    = gray[y_min:y_max, x_min:x_max]
-            mouth_resized = cv2.resize(mouth_crop, (target_w, target_h))
+            face = faces[0]
+            lm   = predictor(gray, face)
+            crop = crop_mouth(frame_rgb, lm)
             labels.append(f"Frame {frame_idx}")
 
-        crops.append(mouth_resized)
+        crops.append(crop)
 
     cap.release()
 
-    # Plot grid of crops
+    # Show canonical size
+    size = canonical_size(crops)
+    print(f"\nVideo: {os.path.basename(video_path)}")
+    print(f"Canonical batch size (median): {size[1]}×{size[0]} px")
+    print(f"Showing {len(crops)} frames  —  each at its own native crop size\n")
+
     cols = 5
     rows = (len(crops) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 2))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.2, rows * 2.2))
     axes = axes.flatten()
 
     for i, (crop, label) in enumerate(zip(crops, labels)):
-        axes[i].imshow(crop, cmap="gray", vmin=0, vmax=255)
-        axes[i].set_title(label, fontsize=8)
-        axes[i].set_xlabel(f"{crop.shape[1]}×{crop.shape[0]}px", fontsize=7)
+        axes[i].imshow(crop)
+        axes[i].set_title(label, fontsize=7)
+        axes[i].set_xlabel(f"{crop.shape[1]}×{crop.shape[0]}px", fontsize=6)
         axes[i].tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
     for j in range(len(crops), len(axes)):
         axes[j].axis("off")
 
     plt.suptitle(
-        f"Cropped Mouth Frames — Model Input ({target_w}×{target_h} grayscale)",
-        fontsize=13, fontweight="bold",
+        f"Adaptive Mouth Crops — {os.path.basename(video_path)}\n"
+        f"Each tile = native resolution crop  |  Canonical batch size: {size[1]}×{size[0]} px",
+        fontsize=11, fontweight="bold",
     )
     plt.tight_layout()
     plt.show()
 
-    print(f"\n✅ {len(crops)} frames shown out of {total_frames} total.")
-    print(f"   Each crop is {target_w}×{target_h} px grayscale — matching model input.")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI entry-point
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualise face landmarks and/or mouth crops.")
-    parser.add_argument("--video", required=False, default=None,
-                        help="Path to your video file.")
-    parser.add_argument("--mode", choices=["landmarks", "crops", "both"], default="both",
-                        help="What to display (default: both).")
-    parser.add_argument("--frames", type=int, default=6,
-                        help="Number of frames to sample for landmarks view (default: 6).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video",  default=None)
+    parser.add_argument("--mode",   choices=["landmarks", "crops", "both"], default="both")
+    parser.add_argument("--frames", type=int, default=6)
     args = parser.parse_args()
 
-    VIDEO_PATH = args.video or r"C:\users\firas\onedrive\desktop\9rayaaaa\pfa\pfa2\files\RL tests\vids\bin blue at f four please.mpg"
+    VIDEO_PATH = args.video or r"C:\path\to\your\video.mp4"
 
     if args.mode in ("landmarks", "both"):
         visualize_landmarks(VIDEO_PATH, num_frames_to_show=args.frames)
-
     if args.mode in ("crops", "both"):
         visualize_mouth_crops(VIDEO_PATH, num_frames_to_show=15)

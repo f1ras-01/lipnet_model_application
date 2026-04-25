@@ -1,31 +1,31 @@
 """
 data_loader.py
 --------------
-All functions responsible for turning raw files on disk into tensors/arrays
-that the model can consume.
+Video and alignment loading — fully adaptive spatial resolution.
 
-Three loaders are provided:
+Every loader now produces crops at native resolution (no fixed resize).
+The spatial dimensions vary per video and are handled by:
+  - crop_utils.canonical_size()  to pick one H×W per video
+  - crop_utils.resize_to_canonical()  to standardize within a video
+  - dataset.py padded_batch  to standardize within a training batch
+  - model GlobalAveragePooling2D  to collapse spatial dims in the model
 
-  load_video(path)
-      For GRID corpus .mpg files — uses a hardcoded pixel crop because
-      the GRID corpus has a fixed camera with the speaker always in the
-      same position in the frame.
+Three loaders:
+  load_video(path, augment=False)
+      GRID corpus .mpg -> (75, H, W, 3) float32   H,W vary by video
 
   load_alignments(path)
-      Reads a GRID .align file and returns integer-encoded character labels.
+      GRID .align -> int64 character indices
 
-  load_data(path)
-      Combines load_video + load_alignments into a single (frames, labels) tuple.
-      Wrapped in a tf.py_function by mappable_function so it works inside a
-      tf.data pipeline.
+  load_data(path, augment=False)
+      Combines both — used via mappable_function in the tf.data pipeline
 
   load_custom_video(video_path)
-      For your own recorded videos — uses dlib to detect and crop the mouth
-      region dynamically, then pads/samples to exactly 75 frames.
+      Any webcam/recorded video -> (75, H, W, 3) float32 via dlib
 """
 
 import os
-from typing import List
+import random
 
 import cv2
 import dlib
@@ -35,247 +35,284 @@ import tensorflow as tf
 from config import (
     ALIGN_DIR, DATA_DIR, DLIB_MODEL_PATH,
     GRID_CROP_X, GRID_CROP_Y,
-    TARGET_FRAMES, TARGET_H, TARGET_W,
+    MIN_CROP_H, MIN_CROP_W,
+    TARGET_C, TARGET_FRAMES,
+)
+from crop_utils import (
+    canonical_size, crop_mouth, normalize_rgb, resize_to_canonical,
 )
 from utils import char_to_num
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame jitter augmentation (paper Section 4.1, p=0.05 per frame)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _frame_jitter(frames: list, p: float = 0.05) -> list:
+    result = []
+    for f in frames:
+        r = random.random()
+        if r < p / 2:
+            continue
+        elif r < p:
+            result.extend([f, f])
+        else:
+            result.append(f)
+    return result if result else frames
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dlib tools (lazy-loaded once)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_detector  = None
+_predictor = None
+
+
+def _get_dlib():
+    global _detector, _predictor
+    if _detector is None:
+        if not os.path.exists(DLIB_MODEL_PATH):
+            raise FileNotFoundError(
+                f"dlib model not found: {DLIB_MODEL_PATH}\n"
+                "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+            )
+        _detector  = dlib.get_frontal_face_detector()
+        _predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
+    return _detector, _predictor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRID corpus loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_video(path: str) -> tf.Tensor:
+def load_video(path: str, augment: bool = False) -> np.ndarray:
     """
-    Load a GRID corpus .mpg file and return normalised grayscale frames.
+    Load a GRID .mpg file and return adaptively-cropped, normalized RGB frames.
 
-    Steps:
-      1. Read every frame from the video with OpenCV.
-      2. Convert to grayscale.
-      3. Crop the fixed mouth region (190:236, 80:220) → shape (46, 140, 1).
-      4. Z-normalise: subtract mean, divide by std.
+    GRID has a fixed camera so a coarse pixel crop is applied first to isolate
+    the lower-face area, then dlib refines the exact lip region within that area.
+    This two-stage approach is faster than running dlib on the full frame and
+    produces cleaner crops on the fixed-camera GRID setup.
 
-    Returns:
-        tf.Tensor of shape (N_frames, 46, 140, 1) dtype float32.
-    """
-    cap = cv2.VideoCapture(path)
-    frames = []
-
-    for _ in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT))):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = tf.image.rgb_to_grayscale(frame)           # (H, W, 1)
-        frames.append(frame[GRID_CROP_Y, GRID_CROP_X, :]) # (46, 140, 1)
-
-    cap.release()
-
-    mean = tf.math.reduce_mean(frames)
-    std  = tf.math.reduce_std(tf.cast(frames, tf.float32))
-    return tf.cast((frames - mean), tf.float32) / std
-
-
-def load_alignments(path: str) -> tf.Tensor:
-    """
-    Parse a GRID .align file and return integer-encoded character labels.
-
-    .align format (one word per line):
-        <start_frame> <end_frame> <word>
-    Lines where the word is 'sil' (silence) are skipped.
-
-    Returns:
-        tf.Tensor of shape (N_chars,) dtype int64.
-    """
-    with open(path, "r") as f:
-        lines = f.readlines()
-
-    tokens = []
-    for line in lines:
-        parts = line.split()
-        if parts[2] != "sil":
-            tokens = [*tokens, " ", parts[2]]   # space-separated words
-
-    # Split each word string into individual characters, flatten, encode
-    return char_to_num(
-        tf.reshape(
-            tf.strings.unicode_split(tokens, input_encoding="UTF-8"),
-            (-1,)
-        )
-    )[1:]   # drop the leading space
-
-
-def load_data(path: tf.Tensor):
-    """
-    Combines load_video + load_alignments for one sample.
-
-    Derives both the video path and the alignment path from the file stem
-    (e.g. 'bbal6n' → data/s1/bbal6n.mpg + data/alignments/s1/bbal6n.align).
-
-    Used via mappable_function inside the tf.data pipeline.
-
-    Returns:
-        (frames, alignments) — a (float32 tensor, int64 tensor) tuple.
-    """
-    path = bytes.decode(path.numpy())
-
-    # Windows path splitting (change to '/' for Linux/Mac)
-    file_name = path.split("\\")[-1].split(".")[0]
-    # Fallback: also handle forward-slash paths
-    if "/" in path and "\\" not in path:
-        file_name = path.split("/")[-1].split(".")[0]
-
-    video_path     = os.path.join(DATA_DIR,  f"{file_name}.mpg")
-    alignment_path = os.path.join(ALIGN_DIR, f"{file_name}.align")
-
-    frames     = load_video(video_path)
-    alignments = load_alignments(alignment_path)
-    return frames, alignments
-
-
-def mappable_function(path: str) -> List[str]:
-    """
-    Wraps load_data in tf.py_function so it can be used with dataset.map().
-
-    tf.data requires functions that return tf.Tensors; tf.py_function is the
-    bridge that lets plain Python functions run inside the pipeline.
-    """
-    result = tf.py_function(load_data, [path], (tf.float32, tf.int64))
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom video loader (for your own recordings)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def load_custom_video(
-    video_path: str,
-    target_frames: int = TARGET_FRAMES,
-    target_h: int = TARGET_H,
-    target_w: int = TARGET_W,
-) -> np.ndarray:
-    """
-    Load a custom (non-GRID) video, detect the mouth region with dlib,
-    crop and resize each frame, pad/sample to exactly 75 frames.
-
-    Unlike load_video() which relies on a fixed pixel crop, this function
-    dynamically detects facial landmarks in every frame so it works with
-    any camera angle, resolution, or face position.
+    The output H×W varies per video (face distance, expression, recording session).
 
     Args:
-        video_path:    Path to any .mp4 / .mpg / .avi / .mov file.
-        target_frames: Number of output frames (default 75).
-        target_h:      Output frame height in pixels (default 46).
-        target_w:      Output frame width in pixels (default 140).
+        path:    Path to a GRID .mpg file.
+        augment: If True, apply H-flip and frame jitter (training only).
 
     Returns:
-        np.ndarray of shape (75, 46, 140, 1) dtype float32, values in [0, 1].
-
-    Raises:
-        FileNotFoundError: if DLIB_MODEL_PATH does not exist.
-        ValueError:        if the video cannot be opened or has no frames.
+        np.ndarray (75, H, W, 3) float32.  H and W are multiples of 8.
     """
+    detector, predictor = _get_dlib()
 
-    # ── 0. Guard: check dlib model exists ────────────────────────────────────
-    if not os.path.exists(DLIB_MODEL_PATH):
-        raise FileNotFoundError(
-            f"dlib landmark model not found at: {DLIB_MODEL_PATH}\n"
-            "Download it from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-        )
-
-    # ── 1. Load dlib detector and landmark predictor ──────────────────────────
-    detector  = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
-
-    # Landmark indices 48–67 correspond to the outer and inner lip contours
-    MOUTH_POINTS = list(range(48, 68))
-
-    # ── 2. Open the video ─────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video: {video_path}")
-
-    frames = []
+    cap  = cv2.VideoCapture(path)
+    raw_crops = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = detector(gray)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # ── Stage 1: coarse pixel crop (GRID-specific fixed camera) ──────────
+        # Extract the lower-face region to speed up dlib and reduce FP detections
+        roi = frame_rgb[GRID_CROP_Y.start - 60 : GRID_CROP_Y.stop + 60,
+                        GRID_CROP_X.start - 40 : GRID_CROP_X.stop + 40]
+
+        # ── Stage 2: dlib adaptive lip crop ──────────────────────────────────
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        faces    = detector(gray_roi)
 
         if len(faces) == 0:
-            # No face detected — use a black (zero) frame as a placeholder
-            mouth_resized = np.zeros((target_h, target_w), dtype=np.uint8)
+            # Fallback: use the fixed pixel crop directly at minimum size
+            fallback = frame_rgb[GRID_CROP_Y, GRID_CROP_X]
+            crop = cv2.resize(fallback, (MIN_CROP_W, MIN_CROP_H),
+                              interpolation=cv2.INTER_LANCZOS4)
         else:
-            face      = faces[0]   # use the first / largest detected face
-            landmarks = predictor(gray, face)
+            face      = faces[0]
+            landmarks = predictor(gray_roi, face)
+            crop      = crop_mouth(roi, landmarks)
 
-            # Collect (x, y) of every mouth landmark
-            mouth_coords = np.array([
-                [landmarks.part(n).x, landmarks.part(n).y]
-                for n in MOUTH_POINTS
-            ])
-
-            # Bounding box with 10-pixel padding on all sides
-            x_min = max(int(mouth_coords[:, 0].min()) - 10, 0)
-            x_max = min(int(mouth_coords[:, 0].max()) + 10, frame.shape[1])
-            y_min = max(int(mouth_coords[:, 1].min()) - 10, 0)
-            y_max = min(int(mouth_coords[:, 1].max()) + 10, frame.shape[0])
-
-            mouth_crop    = gray[y_min:y_max, x_min:x_max]
-            # cv2.resize takes (width, height) — note the order!
-            mouth_resized = cv2.resize(mouth_crop, (target_w, target_h))
-
-        frames.append(mouth_resized)
+        raw_crops.append(crop)
 
     cap.release()
 
-    # ── 3. Normalise frame count to exactly target_frames ────────────────────
-    total = len(frames)
+    # ── Augmentation ─────────────────────────────────────────────────────────
+    if augment:
+        raw_crops = _frame_jitter(raw_crops, p=0.05)
+        if random.random() < 0.5:
+            raw_crops = [np.fliplr(c) for c in raw_crops]
+
+    # ── Fix frame count ───────────────────────────────────────────────────────
+    total = len(raw_crops)
     if total == 0:
-        raise ValueError(f"No frames could be read from: {video_path}")
-
-    if total < target_frames:
-        # Pad by repeating the last frame
-        pad    = [frames[-1]] * (target_frames - total)
-        frames = frames + pad
+        dummy = np.zeros((MIN_CROP_H, MIN_CROP_W, TARGET_C), dtype=np.uint8)
+        raw_crops = [dummy] * TARGET_FRAMES
+    elif total < TARGET_FRAMES:
+        raw_crops = raw_crops + [raw_crops[-1]] * (TARGET_FRAMES - total)
     else:
-        # Uniformly sub-sample so we keep target_frames evenly spread frames
-        indices = np.linspace(0, total - 1, target_frames, dtype=int)
-        frames  = [frames[i] for i in indices]
+        idx       = np.linspace(0, total - 1, TARGET_FRAMES, dtype=int)
+        raw_crops = [raw_crops[i] for i in idx]
 
-    # ── 4. Stack, add channel dim, normalise to [0, 1] ───────────────────────
-    video_array = np.stack(frames, axis=0)               # (75, 46, 140)
-    video_array = np.expand_dims(video_array, axis=-1)   # (75, 46, 140, 1)
-    # ---Z-normalize: subtract mean, divide by std ---
-    # This MUST match what load_video() does for GRID training data.
-    # The model weights were tuned for inputs with mean≈0, std≈1.
-    video_array = video_array.astype(np.float32)
-    mean = video_array.mean()
-    std  = video_array.std()
-    if std > 0:
-        video_array = (video_array - mean) / std
-    else:
-        video_array = video_array - mean   # fallback: avoid division by zero
+    # ── Standardize spatial dims within this video ────────────────────────────
+    # All 75 crops from one video are resized to the same (H, W) so they can
+    # be stacked. padded_batch will then handle variation BETWEEN videos.
+    size   = canonical_size(raw_crops)
+    arr    = resize_to_canonical(raw_crops, size)    # (75, H, W, 3) uint8
+    return normalize_rgb(arr)                        # (75, H, W, 3) float32
 
-    return video_array
+
+def load_alignments(path: str) -> tf.Tensor:
+    """Parse GRID .align file -> integer-encoded character tensor."""
+    with open(path, "r") as f:
+        lines = f.readlines()
+    tokens = []
+    for line in lines:
+        parts = line.split()
+        if parts[2] != "sil":
+            tokens = [*tokens, " ", parts[2]]
+    return char_to_num(
+        tf.reshape(tf.strings.unicode_split(tokens, input_encoding="UTF-8"), (-1,))
+    )[1:]
+
+
+def load_data(path: tf.Tensor, augment: bool = False):
+    path_str   = bytes.decode(path.numpy())
+    file_name  = path_str.replace("\\", "/").split("/")[-1].split(".")[0]
+    video_path = os.path.join(DATA_DIR,  f"{file_name}.mpg")
+    align_path = os.path.join(ALIGN_DIR, f"{file_name}.align")
+    frames     = load_video(video_path, augment=augment)
+    alignments = load_alignments(align_path)
+    return frames, alignments
+
+
+def mappable_function(path: str):
+    return tf.py_function(
+        lambda p: load_data(p, augment=False), [path], (tf.float32, tf.int64)
+    )
+
+
+def mappable_function_augment(path: str):
+    return tf.py_function(
+        lambda p: load_data(p, augment=True), [path], (tf.float32, tf.int64)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick test (run this file directly to verify loaders work)
+# Custom video loader (your own recordings)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_custom_video(video_path: str) -> np.ndarray:
+    """
+    Load any recorded video, detect the mouth adaptively, and return
+    normalized frames at the video's native resolution.
+
+    No fixed target H×W. The crop size is determined entirely by dlib —
+    if the face is close to the camera you get a large, detailed crop;
+    if the face is far you get a smaller crop. Both are handled correctly
+    by the model's GlobalAveragePooling2D layer.
+
+    Args:
+        video_path: Path to any .mp4 / .mpg / .avi / .mov file.
+
+    Returns:
+        np.ndarray (75, H, W, 3) float32.  H, W are multiples of 8.
+
+    Raises:
+        FileNotFoundError: if dlib model is missing.
+        ValueError:        if the video cannot be opened or has no frames.
+    """
+    detector, predictor = _get_dlib()
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    # Read video metadata for progress reporting
+    total_frames_approx = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_native = cap.get(cv2.CAP_PROP_FPS) or 25
+    h_native   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w_native   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    print(f"  Video info: {w_native}×{h_native} px  |  {fps_native:.1f} fps  |  ~{total_frames_approx} frames")
+
+    raw_crops      = []
+    detected_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces     = detector(gray)
+
+        if len(faces) == 0:
+            crop = None   # placeholder — will be filled after loop
+        else:
+            face      = faces[0]
+            landmarks = predictor(gray, face)
+            crop      = crop_mouth(frame_rgb, landmarks)
+            detected_count += 1
+
+        raw_crops.append(crop)
+
+    cap.release()
+
+    total = len(raw_crops)
+    if total == 0:
+        raise ValueError(f"No frames read from: {video_path}")
+
+    detection_rate = detected_count / total * 100
+    print(f"  Detected face in {detected_count}/{total} frames ({detection_rate:.1f}%)")
+    if detection_rate < 50:
+        print(f"  ⚠ Low detection rate. Try recording in better lighting, closer to camera.")
+
+    # Fill None placeholders with the nearest detected crop
+    # (forward-fill then backward-fill)
+    last_good = None
+    for i in range(len(raw_crops)):
+        if raw_crops[i] is not None:
+            last_good = raw_crops[i]
+        elif last_good is not None:
+            raw_crops[i] = last_good.copy()
+
+    last_good = None
+    for i in range(len(raw_crops) - 1, -1, -1):
+        if raw_crops[i] is not None:
+            last_good = raw_crops[i]
+        elif last_good is not None:
+            raw_crops[i] = last_good.copy()
+
+    # Final fallback: still None means no face found anywhere
+    if any(c is None for c in raw_crops):
+        dummy = np.zeros((MIN_CROP_H, MIN_CROP_W, TARGET_C), dtype=np.uint8)
+        raw_crops = [c if c is not None else dummy for c in raw_crops]
+
+    # Fix frame count
+    if total < TARGET_FRAMES:
+        raw_crops = raw_crops + [raw_crops[-1]] * (TARGET_FRAMES - total)
+    else:
+        idx       = np.linspace(0, total - 1, TARGET_FRAMES, dtype=int)
+        raw_crops = [raw_crops[i] for i in idx]
+
+    # Standardize spatial dims within this video
+    size = canonical_size(raw_crops)
+    arr  = resize_to_canonical(raw_crops, size)   # (75, H, W, 3) uint8
+
+    print(f"  Crop size  : {arr.shape[2]}×{arr.shape[1]} px  (adaptive, native resolution)")
+
+    return normalize_rgb(arr)   # (75, H, W, 3) float32
+
 
 if __name__ == "__main__":
     import glob
-
-    # Test GRID loader on the first available .mpg file
     mpg_files = glob.glob(os.path.join(DATA_DIR, "*.mpg"))
     if mpg_files:
-        test_file = mpg_files[0]
-        print(f"Testing GRID loader on: {test_file}")
-        frames, aligns = load_data(tf.constant(test_file))
-        print(f"  frames shape : {frames.shape}")
-        print(f"  aligns shape : {aligns.shape}")
+        f, a = load_data(tf.constant(mpg_files[0]))
+        print(f"frames: {f.shape}  |  min={f.min():.3f}  max={f.max():.3f}")
+        print(f"labels: {a.shape}")
     else:
-        print(f"No .mpg files found in {DATA_DIR} — skipping GRID loader test.")
+        print(f"No .mpg files in {DATA_DIR}")
