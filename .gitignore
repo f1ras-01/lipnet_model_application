@@ -1,0 +1,43 @@
+# Compiled Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+lipnet_env/
+venv/
+env/
+
+# Large datasets & media
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.mpg
+*.avi
+*.mov
+*.jpg
+*.png
+data/
+archive/
+miraclvc1/
+personal_data/
+
+# Model checkpoints (often large)
+models/
+checkpoints/
+*.h5
+*.ckpt
+*.weights
+
+# IDE / OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
