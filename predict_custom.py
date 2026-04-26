@@ -14,7 +14,14 @@ Run with:
 
 import argparse
 import numpy as np
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # silences C++ layer: INFO, WARNING, ERROR
+os.environ["CUDA_VISIBLE_DEVICES"]  = ""    # stops TF from probing for CUDA at all
+
 import tensorflow as tf
+
+tf.get_logger().setLevel("ERROR")           # silences Python-level TF warnings
 
 physical_devices = tf.config.list_physical_devices("GPU")
 try:

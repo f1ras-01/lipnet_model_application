@@ -23,12 +23,16 @@ Run with:
     python train_combined.py --mode miracl   --miracl-root miraclvc1/ --no-grid
 """
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"       # suppress TF C++ INFO / WARNING / ERROR logs
+os.environ["CUDA_VISIBLE_DEVICES"]  = ""        # tell TF not to look for CUDA at all on CPU-only machines
+
 import argparse
 import glob
 import importlib
-import os
 
 import tensorflow as tf
+tf.get_logger().setLevel("ERROR")               # suppress Python-level TF warnings
 
 # ── GPU setup ─────────────────────────────────────────────────────────────────
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -98,7 +102,7 @@ def main():
     if args.mode == "miracl":
         from data_loader_miracl import build_miracl_dataset
         miracl_train, miracl_test = build_miracl_dataset(
-            miracl_root  = args.miracl_root,
+            archive_root = args.miracl_root,
             use_phrases  = True,
             augment      = args.augment,
         )
