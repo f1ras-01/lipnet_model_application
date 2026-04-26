@@ -32,21 +32,18 @@ Archive layout:
         └── F02/ ... F06/
 
 Loading strategy:
-  - F01–F06 (words):   load from cropped/ — no dlib, faster and more accurate
-  - F01–F10 (phrases): load from dataset/ with dlib (cropped/ has no phrases)
-  - F07–F10 (words):   load from dataset/ with dlib
-
-The pre-cropped images are already mouth-region crops so they are passed
-directly to canonical_size() + resize_to_canonical() without any detection step.
+  - F01-F06 (words):   load from cropped/ — no dlib, faster and more accurate
+  - F01-F10 (phrases): load from dataset/ with dlib (cropped/ has no phrases)
+  - F07-F10 (words):   load from dataset/ with dlib
 """
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["CUDA_VISIBLE_DEVICES"]  = ""
 
-import os
 import glob
 import random
+import threading
 from typing import List, Tuple
 
 import cv2
@@ -78,51 +75,54 @@ MIRACL_PHRASES = {
     "09": "how are you",      "10": "have a good time",
 }
 
-# ── Dlib (lazy-loaded once, only used when cropped/ is not available) ─────────
 
-_detector  = None
-_predictor = None
+# ── Dlib — thread-safe lazy initialization ────────────────────────────────────
+#
+# tf.data with AUTOTUNE runs map() in multiple parallel threads.
+# Without a lock, Thread A can set _detector but not yet _predictor,
+# while Thread B reads _detector (not None) and skips the init block,
+# returning (detector, None) — causing "NoneType is not callable".
+#
+# Double-checked locking pattern: cheap check outside the lock,
+# guaranteed-correct re-check inside the lock.
+
 MOUTH_POINTS = list(range(48, 68))
+_dlib_lock   = threading.Lock()
+_detector    = None
+_predictor   = None
 
 
 def _get_dlib():
+    """Return (detector, predictor), initializing them once in a thread-safe way."""
     global _detector, _predictor
-    if _detector is None:
-        if not os.path.exists(DLIB_MODEL_PATH):
-            raise FileNotFoundError(
-                f"dlib model not found: {DLIB_MODEL_PATH}\n"
-                "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-            )
-        _detector  = dlib.get_frontal_face_detector()
-        _predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
+    if _detector is None or _predictor is None:          # fast path (no lock needed usually)
+        with _dlib_lock:
+            if _detector is None or _predictor is None:  # re-check under lock
+                if not os.path.exists(DLIB_MODEL_PATH):
+                    raise FileNotFoundError(
+                        f"dlib model not found: {DLIB_MODEL_PATH}\n"
+                        "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+                    )
+                _detector  = dlib.get_frontal_face_detector()
+                _predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
     return _detector, _predictor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image reading helpers
+# Image reading helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_color_images(instance_folder: str) -> List[np.ndarray]:
     """
     Read all color_*.jpg files from an instance folder in sorted order.
     Depth images (depth_*.png) are ignored.
-
-    Args:
-        instance_folder: Path like .../F01/words/01/01/
-
-    Returns:
-        List of RGB np.ndarray images (uint8, variable size).
-        Returns empty list if no images found.
     """
-    # Glob only color images — explicitly exclude depth
     paths = sorted(glob.glob(os.path.join(instance_folder, "color_*.jpg")))
     if not paths:
-        # Fallback: any jpg that isn't depth
         paths = sorted([
             p for p in glob.glob(os.path.join(instance_folder, "*.jpg"))
             if "depth" not in os.path.basename(p).lower()
         ])
-
     images = []
     for p in paths:
         img = cv2.imread(p)
@@ -132,20 +132,13 @@ def _read_color_images(instance_folder: str) -> List[np.ndarray]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Path A — Pre-cropped images (cropped/ folder, F01–F06 words only)
-# No dlib needed — images are already mouth crops
+# Path A — Pre-cropped images (cropped/ folder, F01-F06 words only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_from_cropped(instance_folder: str, augment: bool = False) -> np.ndarray:
     """
-    Load an utterance from the pre-cropped archive.
-
-    Images are already mouth crops — just read, optionally augment,
-    standardise frame count, and normalise.
-
-    Args:
-        instance_folder: Path like archive/cropped/F01/words/01/01/
-        augment:         Apply H-flip + frame jitter if True.
+    Load from the pre-cropped archive. No dlib needed — images are already
+    mouth crops.
 
     Returns:
         np.ndarray (75, H, W, 3) float32.
@@ -156,13 +149,11 @@ def _load_from_cropped(instance_folder: str, augment: bool = False) -> np.ndarra
         dummy = np.zeros((MIN_CROP_H, MIN_CROP_W, TARGET_C), dtype=np.uint8)
         raw   = [dummy] * TARGET_FRAMES
 
-    # Augmentation
     if augment:
         raw = _frame_jitter(raw, p=0.05)
         if random.random() < 0.5:
             raw = [np.fliplr(f) for f in raw]
 
-    # Fix frame count to exactly TARGET_FRAMES
     total = len(raw)
     if total < TARGET_FRAMES:
         raw = raw + [raw[-1]] * (TARGET_FRAMES - total)
@@ -170,33 +161,26 @@ def _load_from_cropped(instance_folder: str, augment: bool = False) -> np.ndarra
         idx = np.linspace(0, total - 1, TARGET_FRAMES, dtype=int)
         raw = [raw[i] for i in idx]
 
-    # Standardise spatial dims within this utterance + normalise
     size = canonical_size(raw)
-    arr  = resize_to_canonical(raw, size)   # (75, H, W, 3) uint8
-    return normalize_rgb(arr)               # (75, H, W, 3) float32
+    arr  = resize_to_canonical(raw, size)
+    return normalize_rgb(arr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Path B — Full frames (dataset/ folder, all speakers, all categories)
-# Uses dlib to detect and crop the mouth region
+# Path B — Full frames (dataset/ folder, uses dlib)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_from_dataset(instance_folder: str, augment: bool = False) -> np.ndarray:
     """
-    Load an utterance from full frames and crop the mouth via dlib.
-
-    Used for:
-      - Speakers F07–F10 (not present in cropped/)
-      - All phrase utterances (cropped/ has no phrases subfolder)
-
-    Args:
-        instance_folder: Path like archive/dataset/F07/words/01/01/
-        augment:         Apply H-flip + frame jitter if True.
+    Load from full frames and crop the mouth via dlib.
+    Used for speakers F07-F10 and all phrase utterances.
 
     Returns:
         np.ndarray (75, H, W, 3) float32.
     """
+    # Get dlib tools — thread-safe, guaranteed both are non-None here
     detector, predictor = _get_dlib()
+
     raw_frames = _read_color_images(instance_folder)
 
     if not raw_frames:
@@ -218,7 +202,7 @@ def _load_from_dataset(instance_folder: str, augment: bool = False) -> np.ndarra
             landmarks = predictor(gray, face)
             raw_crops.append(crop_mouth(frame_rgb, landmarks))
 
-    # Forward + backward fill for frames with no detection
+    # Forward fill then backward fill for frames with no detection
     last = None
     for i in range(len(raw_crops)):
         if raw_crops[i] is not None:
@@ -235,13 +219,11 @@ def _load_from_dataset(instance_folder: str, augment: bool = False) -> np.ndarra
     dummy = np.zeros((MIN_CROP_H, MIN_CROP_W, TARGET_C), dtype=np.uint8)
     raw_crops = [c if c is not None else dummy for c in raw_crops]
 
-    # Augmentation
     if augment:
         raw_crops = _frame_jitter(raw_crops, p=0.05)
         if random.random() < 0.5:
             raw_crops = [np.fliplr(c) for c in raw_crops]
 
-    # Fix frame count
     total = len(raw_crops)
     if total < TARGET_FRAMES:
         raw_crops = raw_crops + [raw_crops[-1]] * (TARGET_FRAMES - total)
@@ -263,20 +245,9 @@ def _collect_utterances(
     use_phrases: bool = True,
 ) -> List[Tuple[str, str, str]]:
     """
-    Walk the archive folder tree and return all utterances.
-
-    Returns a list of (instance_folder, label_text, source) tuples where
-    source is either "cropped" or "dataset", used by the loader to pick the
-    right loading path (dlib vs pre-cropped).
-
+    Walk archive/ and return (instance_folder, label_text, source) tuples.
+    source is "cropped" or "dataset" — controls which loader is used.
     Priority: use cropped/ when available, dataset/ as fallback.
-
-    Args:
-        archive_root: Path to the archive/ folder.
-        use_phrases:  Include phrase utterances (from dataset/ only).
-
-    Returns:
-        List of (instance_folder, label_text, source) tuples.
     """
     dataset_root = os.path.join(archive_root, "dataset")
     cropped_root = os.path.join(archive_root, "cropped")
@@ -288,52 +259,47 @@ def _collect_utterances(
         )
 
     utterances = []
-
-    # Collect all speakers from dataset/ (authoritative list)
-    speakers = sorted([
+    speakers   = sorted([
         s for s in os.listdir(dataset_root)
         if os.path.isdir(os.path.join(dataset_root, s))
     ])
 
     for speaker in speakers:
-        # Determine which categories are pre-cropped for this speaker
-        speaker_cropped = os.path.join(cropped_root, speaker) if os.path.isdir(cropped_root) else None
+        sp_cropped = os.path.join(cropped_root, speaker) if os.path.isdir(cropped_root) else None
 
         # ── Words ─────────────────────────────────────────────────────────────
-        words_dataset = os.path.join(dataset_root, speaker, "words")
-        words_cropped = os.path.join(speaker_cropped, "words") if speaker_cropped else None
+        words_ds = os.path.join(dataset_root, speaker, "words")
+        words_cr = os.path.join(sp_cropped, "words") if sp_cropped else None
 
-        if os.path.isdir(words_dataset):
-            for word_id in sorted(os.listdir(words_dataset)):
+        if os.path.isdir(words_ds):
+            for word_id in sorted(os.listdir(words_ds)):
                 label = MIRACL_WORDS.get(word_id)
                 if label is None:
                     continue
 
-                word_path_ds = os.path.join(words_dataset, word_id)
-                word_path_cr = os.path.join(words_cropped, word_id) if (
-                    words_cropped and os.path.isdir(words_cropped)
+                word_path_ds = os.path.join(words_ds, word_id)
+                word_path_cr = os.path.join(words_cr, word_id) if (
+                    words_cr and os.path.isdir(words_cr)
                 ) else None
 
                 for instance in sorted(os.listdir(word_path_ds)):
-                    inst_cropped = os.path.join(word_path_cr, instance) if word_path_cr else None
-                    inst_dataset = os.path.join(word_path_ds, instance)
+                    inst_cr = os.path.join(word_path_cr, instance) if word_path_cr else None
+                    inst_ds = os.path.join(word_path_ds, instance)
 
-                    # Use pre-cropped if available for this instance
-                    if inst_cropped and os.path.isdir(inst_cropped):
-                        utterances.append((inst_cropped, label, "cropped"))
-                    elif os.path.isdir(inst_dataset):
-                        utterances.append((inst_dataset, label, "dataset"))
+                    if inst_cr and os.path.isdir(inst_cr):
+                        utterances.append((inst_cr, label, "cropped"))
+                    elif os.path.isdir(inst_ds):
+                        utterances.append((inst_ds, label, "dataset"))
 
-        # ── Phrases ───────────────────────────────────────────────────────────
-        # cropped/ has no phrases — always load from dataset/ with dlib
+        # ── Phrases (always from dataset/ — cropped/ has no phrases) ──────────
         if use_phrases:
-            phrases_dataset = os.path.join(dataset_root, speaker, "phrases")
-            if os.path.isdir(phrases_dataset):
-                for phrase_id in sorted(os.listdir(phrases_dataset)):
+            phrases_ds = os.path.join(dataset_root, speaker, "phrases")
+            if os.path.isdir(phrases_ds):
+                for phrase_id in sorted(os.listdir(phrases_ds)):
                     label = MIRACL_PHRASES.get(phrase_id)
                     if label is None:
                         continue
-                    phrase_path = os.path.join(phrases_dataset, phrase_id)
+                    phrase_path = os.path.join(phrases_ds, phrase_id)
                     for instance in sorted(os.listdir(phrase_path)):
                         inst_path = os.path.join(phrase_path, instance)
                         if os.path.isdir(inst_path):
@@ -347,7 +313,6 @@ def _collect_utterances(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_miracl_label(label_text: str) -> tf.Tensor:
-    """Convert spoken text string to integer-encoded character tensor."""
     chars = list(label_text)
     return char_to_num(
         tf.reshape(tf.strings.unicode_split(chars, input_encoding="UTF-8"), (-1,))
@@ -359,7 +324,7 @@ def make_miracl_label(label_text: str) -> tf.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_one(folder_bytes, label_bytes, source_bytes, augment: bool = False):
-    """Load one utterance — routes to pre-cropped or dlib path automatically."""
+    """Route to pre-cropped or dlib path based on source field."""
     folder = folder_bytes.numpy().decode("utf-8")
     label  = label_bytes.numpy().decode("utf-8")
     source = source_bytes.numpy().decode("utf-8")
@@ -387,38 +352,27 @@ def build_miracl_dataset(
     """
     Build train and test tf.data.Datasets from the MIRACL archive folder.
 
-    Automatically uses pre-cropped images for speakers F01–F06 (words) and
-    falls back to dlib detection from full frames for F07–F10 and all phrases.
+    Automatically uses pre-cropped images for F01-F06 words and falls back
+    to dlib detection for F07-F10 and all phrases.
 
-    Output format is identical to the GRID pipeline — directly concatenable
-    with dataset.train / dataset.test.
+    Output format is identical to the GRID pipeline — directly concatenable.
 
     Args:
         archive_root:  Path to the archive/ root folder.
         use_phrases:   Include phrase utterances (default True).
         train_split:   Fraction for training (default 0.8).
         batch_size:    Videos per batch (default 2).
-        augment:       Apply H-flip + frame jitter to training set.
+        augment:       Apply H-flip + frame jitter to training split.
         shuffle_seed:  Seed for reproducibility.
 
     Returns:
         (train_dataset, test_dataset)
-
-    Example:
-        from data_loader_miracl import build_miracl_dataset
-
-        miracl_train, miracl_test = build_miracl_dataset("archive/")
-
-        # Combine with GRID:
-        from dataset import train as grid_train, test as grid_test
-        combined = grid_train.concatenate(miracl_train)
     """
     utterances = _collect_utterances(archive_root, use_phrases=use_phrases)
 
     if not utterances:
         raise ValueError(f"No utterances found in: {archive_root}")
 
-    # Count breakdown for user info
     n_cropped = sum(1 for u in utterances if u[2] == "cropped")
     n_dataset = sum(1 for u in utterances if u[2] == "dataset")
     print(f"MIRACL archive: {len(utterances)} utterances total")
@@ -433,7 +387,6 @@ def build_miracl_dataset(
     te_utts = utterances[split:]
     print(f"  Train: {len(tr_utts)}  |  Test: {len(te_utts)}")
 
-    # padded_shapes: None,None for H,W — variable resolution
     _shapes = ([TARGET_FRAMES, None, None, None], [40])
 
     def _make_ds(utts, do_aug):
@@ -466,33 +419,26 @@ if __name__ == "__main__":
     import sys
 
     ROOT = sys.argv[1] if len(sys.argv) > 1 else "archive"
-
     print(f"Scanning: {ROOT}\n")
-    utts = _collect_utterances(ROOT, use_phrases=True)
 
-    n_cr = sum(1 for u in utts if u[2] == "cropped")
-    n_ds = sum(1 for u in utts if u[2] == "dataset")
+    utts  = _collect_utterances(ROOT, use_phrases=True)
+    n_cr  = sum(1 for u in utts if u[2] == "cropped")
+    n_ds  = sum(1 for u in utts if u[2] == "dataset")
     print(f"Total utterances : {len(utts)}")
     print(f"  Pre-cropped    : {n_cr}  (no dlib)")
     print(f"  Full frames    : {n_ds}  (dlib required)")
 
     if utts:
-        # Test one cropped utterance
-        cropped_utts = [u for u in utts if u[2] == "cropped"]
-        if cropped_utts:
-            folder, label, source = cropped_utts[0]
-            print(f"\n[Test] Pre-cropped utterance")
-            print(f"  Folder : {folder}")
-            print(f"  Label  : {label}")
-            frames = _load_from_cropped(folder)
-            print(f"  Shape  : {frames.shape}  min={frames.min():.3f}  max={frames.max():.3f}")
+        cr_utts = [u for u in utts if u[2] == "cropped"]
+        if cr_utts:
+            folder, label, _ = cr_utts[0]
+            print(f"\n[Test] Pre-cropped: {folder}  label={label}")
+            f = _load_from_cropped(folder)
+            print(f"  Shape: {f.shape}  min={f.min():.3f}  max={f.max():.3f}")
 
-        # Test one dataset utterance
-        dataset_utts = [u for u in utts if u[2] == "dataset"]
-        if dataset_utts:
-            folder, label, source = dataset_utts[0]
-            print(f"\n[Test] Full-frame utterance (dlib)")
-            print(f"  Folder : {folder}")
-            print(f"  Label  : {label}")
-            frames = _load_from_dataset(folder)
-            print(f"  Shape  : {frames.shape}  min={frames.min():.3f}  max={frames.max():.3f}")
+        ds_utts = [u for u in utts if u[2] == "dataset"]
+        if ds_utts:
+            folder, label, _ = ds_utts[0]
+            print(f"\n[Test] Full-frame (dlib): {folder}  label={label}")
+            f = _load_from_dataset(folder)
+            print(f"  Shape: {f.shape}  min={f.min():.3f}  max={f.max():.3f}")
