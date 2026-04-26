@@ -19,7 +19,12 @@ After training, weights are saved to:
 """
 
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"]  = ""
+
+import os
 import tensorflow as tf
+tf.get_logger().setLevel("ERROR")
 
 # ── GPU setup ─────────────────────────────────────────────────────────────────
 physical_devices = tf.config.list_physical_devices("GPU")

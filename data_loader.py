@@ -26,6 +26,7 @@ Three loaders:
 
 import os
 import random
+import threading
 
 import cv2
 import dlib
@@ -62,23 +63,34 @@ def _frame_jitter(frames: list, p: float = 0.05) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dlib tools (lazy-loaded once)
+# Dlib tools — thread-safe lazy initialization
+#
+# tf.data AUTOTUNE runs map() in parallel threads. Without a lock:
+#   Thread A sets _detector but hasn't set _predictor yet.
+#   Thread B sees _detector is not None, skips init, returns (detector, None).
+#   predictor(gray, face) → TypeError: NoneType is not callable.
+#
+# Double-checked locking: fast check outside lock, guaranteed re-check inside.
 # ─────────────────────────────────────────────────────────────────────────────
 
+_dlib_lock = threading.Lock()
 _detector  = None
 _predictor = None
 
 
 def _get_dlib():
+    """Return (detector, predictor), initializing both atomically."""
     global _detector, _predictor
-    if _detector is None:
-        if not os.path.exists(DLIB_MODEL_PATH):
-            raise FileNotFoundError(
-                f"dlib model not found: {DLIB_MODEL_PATH}\n"
-                "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-            )
-        _detector  = dlib.get_frontal_face_detector()
-        _predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
+    if _detector is None or _predictor is None:
+        with _dlib_lock:
+            if _detector is None or _predictor is None:   # re-check under lock
+                if not os.path.exists(DLIB_MODEL_PATH):
+                    raise FileNotFoundError(
+                        f"dlib model not found: {DLIB_MODEL_PATH}\n"
+                        "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+                    )
+                _detector  = dlib.get_frontal_face_detector()
+                _predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
     return _detector, _predictor
 
 
