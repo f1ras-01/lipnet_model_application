@@ -47,13 +47,23 @@ CROP_PADDING_RATIO = 0.5
 
 # Minimum crop dimensions in pixels. Prevents the CNN from receiving patches
 # smaller than its kernel sizes (3×5×5 / 3×3×3).
-MIN_CROP_H = 32
-MIN_CROP_W = 48
+# Minimum crop dimensions in pixels.
+#
+# The architecture halves spatial dims 6 times total:
+#   3x Conv3D(stride 1,2,2)  -> div2 each = div8
+#   3x MaxPool3D(1,2,2)      -> div2 each = div8
+#   Total reduction factor   = div64
+#
+# A crop of H pixels produces H/64 pixels before GlobalAveragePooling.
+# If H < 64 the final MaxPool receives a spatial dim < 1 -> CRASH.
+# Setting both to 64 guarantees at least a 1x1 feature map entering GAP.
+MIN_CROP_H = 64
+MIN_CROP_W = 64
 
-# All crop dimensions are rounded UP to the nearest multiple of this value.
-# With 3 MaxPool3D(1,2,2) layers the spatial dims are halved 3 times (÷8).
-# Aligning to 8 keeps every post-pool dimension an integer.
-CROP_ALIGN_MULTIPLE = 8
+# Must match the total spatial reduction factor (64).
+# Crops are rounded UP to multiples of 64 so every dimension divides
+# evenly through all 6 halving stages without producing fractional sizes.
+CROP_ALIGN_MULTIPLE = 64
 
 # ── Color / normalization (paper Appendix A.2) ────────────────────────────────
 

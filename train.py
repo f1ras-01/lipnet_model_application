@@ -20,9 +20,7 @@ After training, weights are saved to:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["CUDA_VISIBLE_DEVICES"]  = ""
 
-import os
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 
@@ -41,7 +39,10 @@ from model import CTCLoss, build_model, get_callbacks
 
 # ── Build and compile ─────────────────────────────────────────────────────────
 model = build_model()
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), loss=CTCLoss)
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
+    loss=CTCLoss,
+)
 model.summary()
 
 # ── (Optional) Resume from existing checkpoint ───────────────────────────────

@@ -177,17 +177,35 @@ def load_video(path: str, augment: bool = False) -> np.ndarray:
 
 
 def load_alignments(path: str) -> tf.Tensor:
-    """Parse GRID .align file -> integer-encoded character tensor."""
+    """
+    Parse a GRID .align file and return integer-encoded character labels.
+
+    Fixed for GPU compatibility: the old code passed a list of multi-character
+    strings to tf.strings.unicode_split() which returns a RaggedTensor.
+    tf.reshape(ragged, (-1,)) silently works on CPU but crashes on GPU because
+    GPU kernels enforce shape contracts strictly.
+
+    Fix: build the full sentence string in plain Python (guaranteed flat),
+    split into individual characters, encode with char_to_num.
+    No TF ragged tensors involved at any point.
+    """
     with open(path, "r") as f:
         lines = f.readlines()
-    tokens = []
+
+    words = []
     for line in lines:
         parts = line.split()
-        if parts[2] != "sil":
-            tokens = [*tokens, " ", parts[2]]
+        if len(parts) >= 3 and parts[2] != "sil":
+            words.append(parts[2])
+
+    # Join into one space-separated string then split to individual characters.
+    # Produces a flat Python list of single chars — no ragged dims anywhere.
+    sentence = " ".join(words)           # e.g. "bin blue at f four please"
+    chars    = list(sentence)            # ["b","i","n"," ","b","l","u","e",...]
+
     return char_to_num(
-        tf.reshape(tf.strings.unicode_split(tokens, input_encoding="UTF-8"), (-1,))
-    )[1:]
+        tf.constant(chars, dtype=tf.string)   # flat 1-D string tensor, GPU-safe
+    )
 
 
 def load_data(path: tf.Tensor, augment: bool = False):

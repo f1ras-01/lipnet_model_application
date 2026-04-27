@@ -25,7 +25,6 @@ Run with:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"       # suppress TF C++ INFO / WARNING / ERROR logs
-os.environ["CUDA_VISIBLE_DEVICES"]  = ""        # tell TF not to look for CUDA at all on CPU-only machines
 
 import argparse
 import glob
@@ -164,7 +163,11 @@ def main():
     # ── Build model and load checkpoint ───────────────────────────────────────
     model = build_model()
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=args.lr,
+            clipnorm=1.0,     # clip gradient norm — prevents NaN loss from
+                              # large padded batches mixing GRID + MIRACL sizes
+        ),
         loss=CTCLoss,
     )
 

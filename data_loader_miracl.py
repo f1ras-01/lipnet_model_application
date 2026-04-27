@@ -313,9 +313,13 @@ def _collect_utterances(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_miracl_label(label_text: str) -> tf.Tensor:
-    chars = list(label_text)
+    """
+    Convert spoken text to integer-encoded character tensor.
+    Uses tf.constant on a flat list — GPU-safe, no RaggedTensor involved.
+    """
+    chars = list(label_text)   # plain Python list of single-char strings
     return char_to_num(
-        tf.reshape(tf.strings.unicode_split(chars, input_encoding="UTF-8"), (-1,))
+        tf.constant(chars, dtype=tf.string)
     )
 
 
