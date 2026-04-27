@@ -25,6 +25,7 @@ Run with:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"       # suppress TF C++ INFO / WARNING / ERROR logs
+os.environ["CUDA_VISIBLE_DEVICES"]  = ""        # tell TF not to look for CUDA at all on CPU-only machines
 
 import argparse
 import glob
@@ -174,9 +175,24 @@ def main():
     if os.path.exists(CHECKPOINT_PATH + ".index"):
         model.load_weights(CHECKPOINT_PATH).expect_partial()
         print(f"✅ Checkpoint loaded: {CHECKPOINT_PATH}")
-        print(f"   Fine-tuning lr={args.lr}  (lower than initial 1e-4 to avoid forgetting)")
+        print(f"   Fine-tuning with lr={args.lr}")
     else:
-        print("⚠️  No checkpoint found — training from scratch.")
+        # No checkpoint — training from scratch.
+        # The --lr default (1e-5) is designed for fine-tuning only.
+        # Override to 1e-4 (standard initial LR) to escape the inf-loss region.
+        if args.lr < 1e-4:
+            scratch_lr = 1e-4
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(
+                    learning_rate=scratch_lr,
+                    clipnorm=1.0,
+                ),
+                loss=CTCLoss,
+            )
+            print(f"⚠️  No checkpoint — training from scratch at lr={scratch_lr}")
+            print(f"   (overriding --lr {args.lr} which is too small for cold start)")
+        else:
+            print(f"⚠️  No checkpoint — training from scratch at lr={args.lr}")
 
     model.summary()
 

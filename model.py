@@ -130,11 +130,33 @@ def build_model() -> Sequential:
 # ── CTC loss ─────────────────────────────────────────────────────────────────
 
 def CTCLoss(y_true, y_pred):
+    """
+    CTC loss with ACTUAL label lengths — not padded shape lengths.
+
+    Root cause of inf loss:
+      padded_batch pads all labels to the same length (40 by default).
+      If CTCLoss uses the padded length (40) as label_length, CTC requires
+      at least 2*40-1 = 79 time steps to decode. We only have 75 → p=0
+      → log(0) = -inf → loss = +inf.
+
+    Fix:
+      Count non-zero entries per row of y_true. StringLookup reserves index 0
+      for the OOV/padding token, so real characters always have index >= 1.
+      Actual label lengths are always <= 30 chars for GRID/MIRACL sentences,
+      well within the 2*30-1 = 59 minimum steps needed for 75 input frames.
+    """
     batch_len    = tf.cast(tf.shape(y_true)[0], dtype="int64")
     input_length = tf.cast(tf.shape(y_pred)[1], dtype="int64")
-    label_length = tf.cast(tf.shape(y_true)[1], dtype="int64")
+
+    # Actual label length = number of non-zero (non-padding) tokens per sample
+    # Shape: (batch,) -> (batch, 1)
+    label_length = tf.cast(
+        tf.reduce_sum(tf.cast(tf.not_equal(y_true, 0), tf.int64), axis=1, keepdims=True),
+        dtype="int64"
+    )
+
     input_length = input_length * tf.ones(shape=(batch_len, 1), dtype="int64")
-    label_length = label_length * tf.ones(shape=(batch_len, 1), dtype="int64")
+
     return tf.keras.backend.ctc_batch_cost(y_true, y_pred, input_length, label_length)
 
 

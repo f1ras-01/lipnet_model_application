@@ -20,6 +20,7 @@ After training, weights are saved to:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# Note: CUDA_VISIBLE_DEVICES intentionally NOT suppressed — GPU is enabled
 
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
@@ -48,9 +49,11 @@ model.summary()
 # ── (Optional) Resume from existing checkpoint ───────────────────────────────
 if os.path.exists(CHECKPOINT_PATH + ".index"):
     print(f"\nResuming from checkpoint: {CHECKPOINT_PATH}")
-    model.load_weights(CHECKPOINT_PATH)
+    model.load_weights(CHECKPOINT_PATH).expect_partial()
 else:
-    print("\nNo checkpoint found — starting from scratch.")
+    print("\nNo checkpoint — training from scratch at lr=1e-4 (initial rate).")
+    # LEARNING_RATE from config is 1e-4 which is correct for cold start.
+    # The compile() above already uses it — no action needed here.
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 os.makedirs(MODEL_DIR, exist_ok=True)

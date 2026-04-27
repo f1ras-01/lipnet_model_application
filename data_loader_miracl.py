@@ -39,7 +39,7 @@ Loading strategy:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["CUDA_VISIBLE_DEVICES"]  = ""
+# CUDA_VISIBLE_DEVICES not suppressed — GPU enabled
 
 import glob
 import random

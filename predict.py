@@ -14,17 +14,15 @@ Run with:
 Edit VIDEO_PATH below or pass --video on the command line.
 """
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# CUDA_VISIBLE_DEVICES not suppressed — GPU enabled
+
 import argparse
 import os
 
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # silences C++ layer: INFO, WARNING, ERROR
-os.environ["CUDA_VISIBLE_DEVICES"]  = ""    # stops TF from probing for CUDA at all
-
 import tensorflow as tf
-
-tf.get_logger().setLevel("ERROR")           # silences Python-level TF warnings
-
+tf.get_logger().setLevel("ERROR")
 import numpy as np
 
 # ── GPU setup ─────────────────────────────────────────────────────────────────
