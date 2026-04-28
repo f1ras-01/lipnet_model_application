@@ -23,13 +23,12 @@ import os
 
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
+
+from gpu_utils import setup_gpu
+setup_gpu()
 import numpy as np
 
-# ── GPU setup ─────────────────────────────────────────────────────────────────
-physical_devices = tf.config.list_physical_devices("GPU")
 try:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-except (IndexError, RuntimeError):
     pass
 
 # ── Project imports ───────────────────────────────────────────────────────────

@@ -25,13 +25,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 
-# ── GPU setup ─────────────────────────────────────────────────────────────────
-physical_devices = tf.config.list_physical_devices("GPU")
-try:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-    print(f"GPU detected: {physical_devices[0]}")
-except (IndexError, RuntimeError):
-    print("No GPU found — training on CPU (this will be slow).")
+from gpu_utils import setup_gpu
+setup_gpu()
 
 # ── Project imports ───────────────────────────────────────────────────────────
 from config import CHECKPOINT_PATH, EPOCHS, LEARNING_RATE, MODEL_DIR

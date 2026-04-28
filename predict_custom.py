@@ -21,7 +21,8 @@ import numpy as np
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 
-physical_devices = tf.config.list_physical_devices("GPU")
+from gpu_utils import setup_gpu
+setup_gpu()
 try:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
 except (IndexError, RuntimeError):

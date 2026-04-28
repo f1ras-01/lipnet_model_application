@@ -32,15 +32,10 @@ import glob
 import importlib
 
 import tensorflow as tf
-tf.get_logger().setLevel("ERROR")               # suppress Python-level TF warnings
+tf.get_logger().setLevel("ERROR")
 
-# ── GPU setup ─────────────────────────────────────────────────────────────────
-physical_devices = tf.config.list_physical_devices("GPU")
-try:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-    print(f"GPU: {physical_devices[0]}")
-except (IndexError, RuntimeError):
-    print("No GPU found — running on CPU.")
+from gpu_utils import setup_gpu
+setup_gpu()
 
 from config import CHECKPOINT_PATH, MODEL_DIR, TARGET_FRAMES
 from model import CTCLoss, build_model, get_callbacks
